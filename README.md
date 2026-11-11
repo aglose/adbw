@@ -25,6 +25,8 @@ pick up exactly where it left off, so adb never notices.
   60-second shell and a 100 MB push intact. See [docs/field-notes.md](docs/field-notes.md).
 - **Nothing to configure on the device.** It finds your computer by itself and follows it when
   either IP changes.
+- **Several computers at once.** Set the device up from your desktop and your laptop; it keeps
+  a link to each one that is around, and each gets its own adb session.
 - **adb's own security is untouched.** adb's encryption and key checks still run end to end;
   the relay only carries the bytes. The relay link has its own per-device key on top.
 
@@ -85,18 +87,46 @@ adb -s $(adbw serial pixel) logcat
 After that the device reconnects by itself whenever it and the bridge are on the same network,
 including after a reboot.
 
+## Several computers
+
+Run steps 1 to 3 on each computer. Setting a device up from a second computer adds that
+computer; it doesn't replace the first.
+
+```bash
+adbw setup --name pixel
+```
+
+```
+Registered 'pixel' -> adb serial 127.0.0.1:7101  [Wireless debugging (auto port)]
+The device now follows 2 computers; the others keep working.
+```
+
+- Each computer has its own name, serial and key for the device. They don't know about each
+  other, and both can use the device at the same moment.
+- The device connects to whichever of its computers are running `adbw run` on its network. One
+  that is away costs a connection attempt every 15 seconds; its return is noticed within seconds.
+- Each computer still needs adb access of its own the first time (USB, or `adb pair`), exactly
+  as without adbw.
+- `adbw forget NAME` on a computer removes it from the device's list too.
+  `adbw setup --only` makes the computer you run it on the only one, removing all the others.
+  A device follows at most 8 computers.
+
+## Commands
+
 | Command | What it does |
 |---|---|
 | `adbw run` | Run the bridge |
-| `adbw setup [-s SERIAL] [--name N]` | Install, update or re-key the agent on a device |
+| `adbw setup [-s SERIAL] [--name N]` | Install or update the agent on a device and add this computer to it |
+| `adbw setup --only` | The same, and remove every other computer from the device |
 | `adbw status` | Link state, adb state and counters for every device |
 | `adbw devices` | Registered devices and their serials |
 | `adbw serial NAME` | Print a device's serial |
 | `adbw logs NAME` | The agent's own log from the device |
-| `adbw forget NAME` | Remove a device |
+| `adbw forget NAME` | Remove a device here, and this computer from the device |
 
 To update, install the new `adbw` and rerun `adbw setup -s $(adbw serial NAME)`. It can update
-the agent over adbw itself.
+the agent over adbw itself. With several computers, update adbw on all of them: one agent serves
+them all, and an older adbw leaves a newer agent in place rather than downgrading it.
 
 ## Which adbd the agent uses
 
@@ -134,6 +164,9 @@ can work on it, adbw included.
 - The link between agent and bridge is mutually authenticated with a per-device key that
   `adbw setup` installs over adb. A stranger on the network can't register as your device, and
   your device won't follow someone else's bridge.
+- Adding a computer takes adb access to the device, which already means full control of it.
+  Each computer gets a separate key, so removing one (`adbw forget`, or `adbw setup --only`
+  from another) doesn't affect the rest.
 - The link is authenticated but not separately encrypted. With Wireless debugging, adb's TLS
   already encrypts everything inside it. With a legacy `adb tcpip` port, traffic is as
   unencrypted as it already was without adbw.
@@ -170,6 +203,7 @@ workflow builds, publishes the files and updates the Homebrew formula.
 ## Status
 
 Early but working. Tested on a Pixel 10 Pro XL (Android 17, Wireless debugging), an Android 13
-userdebug device with a legacy adb port, and an Android 14 emulator, from macOS. The host tests
+userdebug device with a legacy adb port, and an Android 14 emulator, from macOS. Following two
+computers was tested on the Pixel with two bridges on one Mac, not yet with two machines. The host tests
 also run on Linux and Windows in CI; the device flow hasn't been tried from Windows. Wear OS is
 untested.

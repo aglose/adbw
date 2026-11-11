@@ -6,11 +6,9 @@ import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.text.InputType
 import android.view.View
 import android.widget.Button
 import android.widget.CheckBox
-import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -20,8 +18,6 @@ class MainActivity : Activity() {
     private lateinit var prefs: Prefs
     private lateinit var statusView: TextView
     private lateinit var logView: TextView
-    private lateinit var hostEdit: EditText
-    private lateinit var portEdit: EditText
     private val handler = Handler(Looper.getMainLooper())
     private val refresh = object : Runnable {
         override fun run() {
@@ -55,24 +51,6 @@ class MainActivity : Activity() {
         statusView = label("", 12f).apply { typeface = Typeface.MONOSPACE }
         root.addView(statusView)
 
-        root.addView(label("Bridge host (blank = auto via beacon)"))
-        hostEdit = EditText(this).apply {
-            setSingleLine()
-            hint = "192.168.1.20:7100"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            setText(prefs.host)
-        }
-        root.addView(hostEdit)
-
-        root.addView(label("adbd port (blank = auto: Wireless debugging)"))
-        portEdit = EditText(this).apply {
-            setSingleLine()
-            hint = "auto, or 5555 after `adb tcpip 5555`"
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setText(prefs.fixedPort?.toString() ?: "")
-        }
-        root.addView(portEdit)
-
         val rearm = CheckBox(this).apply {
             text = "Turn Wireless debugging back on after roams"
             isChecked = prefs.rearm
@@ -102,7 +80,6 @@ class MainActivity : Activity() {
         buttons.addView(Button(this).apply {
             text = "Start"
             setOnClickListener {
-                save()
                 val wanted = arrayOf(Manifest.permission.POST_NOTIFICATIONS, Manifest.permission.NEARBY_WIFI_DEVICES)
                     .filter { checkSelfPermission(it) != 0 }
                 if (wanted.isNotEmpty()) requestPermissions(wanted.toTypedArray(), 1)
@@ -119,6 +96,7 @@ class MainActivity : Activity() {
             "Set up from your computer, with this device connected to adb:\n" +
                 "  adbw setup\n" +
                 "then keep `adbw run` going there. The device reconnects by itself.\n" +
+                "Run it on each computer you want to use; they all work at once.\n" +
                 "Faster Wi-Fi rejoin: Developer options > turn off Wi-Fi scan throttling.",
             11f,
         ).apply { typeface = Typeface.MONOSPACE })
@@ -149,42 +127,21 @@ class MainActivity : Activity() {
         applyExtras()
     }
 
-    // What the fields showed when last loaded. Only a field the user actually edited is written
-    // back, so this screen never overwrites settings `adbw setup` changed behind it.
-    private var shownHost = ""
-    private var shownPort = ""
-
-    private fun loadFields() {
-        shownHost = prefs.host
-        shownPort = prefs.fixedPort?.toString() ?: ""
-        hostEdit.setText(shownHost)
-        portEdit.setText(shownPort)
-    }
-
-    private fun save() {
-        val host = hostEdit.text.toString().trim()
-        val port = portEdit.text.toString().trim()
-        if (host != shownHost) prefs.host = host
-        if (port != shownPort) prefs.fixedPort = port.toIntOrNull()
-        shownHost = host
-        shownPort = port
-    }
-
     override fun onResume() {
         super.onResume()
-        loadFields()
         handler.post(refresh)
     }
 
     override fun onPause() {
         handler.removeCallbacks(refresh)
-        save()
         super.onPause()
     }
 
     private fun render() {
         statusView.text = if (AgentState.running) AgentState.detail else buildString {
             appendLine("agent stopped")
+            val names = prefs.bridges.joinToString { it.label }
+            appendLine("computers: ${names.ifEmpty { "none yet (run `adbw setup`)" }}")
             appendLine("Wireless debugging: ${if (WirelessDebugging.isEnabled(this@MainActivity)) "on" else "off"}")
             append("auto re-enable: ${if (WirelessDebugging.canWrite(this@MainActivity)) "ready" else "needs grant (see below)"}")
         }

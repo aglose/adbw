@@ -33,6 +33,21 @@ the stock-adb baseline.
 The host tests (`host/test_resume.py`) repeat this without a device: 24 to 48 MiB each way
 through kills and freezes, one adbd connection, matching hashes.
 
+## Two computers, one device (0.3)
+
+Pixel 10 Pro XL, Android 17, following two bridges (two state directories on one Mac, standing
+in for two computers).
+
+| Test | Result |
+|---|---|
+| Add computer 2 while computer 1 runs a 40 s `adb shell` stream | 40/40 lines; computer 1's link untouched |
+| 30 MB push through computer 2 while computer 1 streams | SHA-256 match (read back through computer 1), 5.4 MB/s; stream 25/25 |
+| Kill computer 2's bridge | computer 1 unaffected |
+| Start computer 2's bridge again | usable within about a second (found by its beacon) |
+| Update the agent through computer 1 | both computers reconnected by themselves |
+| `adbw forget` on computer 2 | agent dropped it; computer 1 unaffected |
+| `adbw setup --only` on computer 1 | agent dropped computer 2 |
+
 ## What real devices taught us
 
 **Android 17 fixed the roaming kill switch.** AOSP `main` at the time of the research turned
@@ -44,6 +59,10 @@ problem; the agent's re-enable covers those.
 **Apps can't read adbd's port.** SELinux denies `service.adb.tls.port` to apps. The agent finds
 the port through on-device mDNS (`_adb-tls-connect._tcp`, or `_adb._tcp` for legacy ports) in
 about a second, including after every port change.
+
+**On Android 17 the adb shell can't read it either.** `getprop service.adb.tls.port` comes back
+empty even over adb. `adbw setup` falls back to the `adb_wifi_enabled` setting to learn that
+Wireless debugging is on, and leaves finding the port to the agent.
 
 **Polling a denied property is expensive.** An early agent retried `getprop` twice a second.
 Each attempt forked a process and logged an SELinux denial, which wasted battery and stalled
@@ -104,6 +123,8 @@ Limits:
   simulations of "the access point vanished" weren't reliable.
 
 ## Open items
+
+- Following several computers has only been tried with two bridges on one machine.
 
 - Wear OS: untested, and the Wi-Fi socket binding needs investigating.
 - Measure rejoin time with and without the scan booster on a real out-of-range walk.

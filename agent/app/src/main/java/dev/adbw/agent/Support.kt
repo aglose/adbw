@@ -11,55 +11,131 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.util.Log
+import org.json.JSONArray
+import org.json.JSONException
+import org.json.JSONObject
 import java.net.InetAddress
 import java.net.NetworkInterface
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.UUID
 import java.util.concurrent.TimeUnit
+
+/**
+ * One computer this device follows: that computer's bridge, plus the identity and link key this
+ * device has there. `adbw setup` on each computer adds or updates its own profile.
+ */
+data class BridgeProfile(
+    val bridgeId: String,
+    val deviceId: String,
+    val key: String,
+    val name: String = "",       // the computer's name, for display only
+    val hostName: String = "",   // its mDNS name ("name.local:port"), tried when all else fails
+    val host: String = "",       // pinned "host:port"; blank = discover by beacon
+    val lastHost: String = "",   // the address that last worked
+    val adbdPort: Int? = null,   // fixed adbd port for this computer; null = Wireless debugging
+    val lastSeen: Long = 0,      // wall-clock ms of the last successful link
+) {
+    val label: String
+        get() = name.ifBlank { hostName.substringBefore('.').substringBefore(':').ifBlank { bridgeId } }
+
+    fun toJson(): JSONObject = JSONObject()
+        .put("bridge_id", bridgeId).put("device_id", deviceId).put("key", key)
+        .put("name", name).put("host_name", hostName).put("host", host)
+        .put("last_host", lastHost).put("adbd_port", adbdPort ?: 0).put("last_seen", lastSeen)
+
+    companion object {
+        fun fromJson(j: JSONObject) = BridgeProfile(
+            bridgeId = j.getString("bridge_id"),
+            deviceId = j.getString("device_id"),
+            key = j.getString("key"),
+            name = j.optString("name"),
+            hostName = j.optString("host_name"),
+            host = j.optString("host"),
+            lastHost = j.optString("last_host"),
+            adbdPort = j.optInt("adbd_port").takeIf { it > 0 },
+            lastSeen = j.optLong("last_seen"),
+        )
+    }
+}
 
 class Prefs(ctx: Context) {
     private val sp = ctx.getSharedPreferences("adbw", Context.MODE_PRIVATE)
 
-    /** Identity and link key, both written by `adbw setup` on the computer. */
-    var deviceId: String
-        get() = sp.getString("device_id", null)
-            ?: UUID.randomUUID().toString().also { sp.edit().putString("device_id", it).apply() }
-        set(v) = sp.edit().putString("device_id", v).apply()
+    companion object {
+        /** More than anyone needs; a cap so a device can't collect profiles without bound. */
+        const val MAX_BRIDGES = 8
+        private val lock = Any()
+    }
 
-    var key: String
-        get() = sp.getString("key", "") ?: ""
-        set(v) = sp.edit().putString("key", v).apply()
+    /** The computers this device follows. */
+    var bridges: List<BridgeProfile>
+        get() = synchronized(lock) { readBridges() }
+        set(v) = synchronized(lock) { writeBridges(v) }
+
+    private fun readBridges(): List<BridgeProfile> {
+        val raw = sp.getString("bridges", null)
+        if (raw != null) {
+            return try {
+                val arr = JSONArray(raw)
+                (0 until arr.length()).map { BridgeProfile.fromJson(arr.getJSONObject(it)) }
+            } catch (e: JSONException) {
+                emptyList()
+            }
+        }
+        // Agents before 0.3 followed one computer, stored as separate settings. Carry it over.
+        val key = sp.getString("key", "") ?: ""
+        val deviceId = sp.getString("device_id", "") ?: ""
+        if (key.isBlank() || deviceId.isBlank()) return emptyList()
+        val migrated = listOf(BridgeProfile(
+            bridgeId = sp.getString("bridge_id", "")?.takeIf { it.isNotBlank() } ?: "default",
+            deviceId = deviceId,
+            key = key,
+            hostName = sp.getString("host_name", "") ?: "",
+            host = sp.getString("host", "") ?: "",
+            lastHost = sp.getString("last_host", "") ?: "",
+            adbdPort = sp.getString("fixed_port", "")?.toIntOrNull(),
+        ))
+        writeBridges(migrated)
+        return migrated
+    }
+
+    private fun writeBridges(v: List<BridgeProfile>) {
+        val arr = JSONArray()
+        v.forEach { arr.put(it.toJson()) }
+        sp.edit().putString("bridges", arr.toString()).apply()
+    }
+
+    fun bridge(id: String): BridgeProfile? = bridges.firstOrNull { it.bridgeId == id }
+
+    /** Add or replace a computer. Beyond the cap, the one not seen for longest makes room. */
+    fun upsertBridge(p: BridgeProfile) = synchronized(lock) {
+        var all = readBridges().filter { it.bridgeId != p.bridgeId } + p
+        while (all.size > MAX_BRIDGES) {
+            val oldest = all.filter { it.bridgeId != p.bridgeId }.minByOrNull { it.lastSeen } ?: break
+            all = all - oldest
+        }
+        writeBridges(all)
+    }
+
+    /** Change one stored profile; returns the new value, or null if that computer was removed. */
+    fun updateBridge(id: String, change: (BridgeProfile) -> BridgeProfile): BridgeProfile? =
+        synchronized(lock) {
+            val all = readBridges()
+            val old = all.firstOrNull { it.bridgeId == id } ?: return@synchronized null
+            val new = change(old)
+            if (new != old) writeBridges(all.map { if (it.bridgeId == id) new else it })
+            new
+        }
+
+    fun removeBridge(id: String) = synchronized(lock) {
+        writeBridges(readBridges().filter { it.bridgeId != id })
+    }
 
     /** The adbd port that last worked, kept across restarts. */
     var lastAdbdPort: Int?
         get() = sp.getInt("last_adbd_port", 0).takeIf { it > 0 }
         set(v) = sp.edit().putInt("last_adbd_port", v ?: 0).apply()
-
-    /** Only follow discovery beacons from this bridge (blank = any). */
-    var bridgeId: String
-        get() = sp.getString("bridge_id", "") ?: ""
-        set(v) = sp.edit().putString("bridge_id", v).apply()
-
-    /** The computer's mDNS name ("name.local:port"), tried when beacons and the last IP fail. */
-    var hostName: String
-        get() = sp.getString("host_name", "") ?: ""
-        set(v) = sp.edit().putString("host_name", v).apply()
-
-    /** "host" or "host:port"; blank = discover via UDP beacon, then last known. */
-    var host: String
-        get() = sp.getString("host", "") ?: ""
-        set(v) = sp.edit().putString("host", v.trim()).apply()
-
-    /** Fixed adbd port (e.g. 5555 after `adb tcpip 5555`); null = auto (Wireless debugging). */
-    var fixedPort: Int?
-        get() = sp.getString("fixed_port", "")?.toIntOrNull()
-        set(v) = sp.edit().putString("fixed_port", v?.toString() ?: "").apply()
-
-    var lastHost: String?
-        get() = sp.getString("last_host", null)
-        set(v) = sp.edit().putString("last_host", v).apply()
 
     var armed: Boolean
         get() = sp.getBoolean("armed", false)
@@ -274,26 +350,49 @@ class AdbdLocator(ctx: Context) {
 
 /**
  * How `adbw setup` configures the agent:
- *   adb shell am broadcast --include-stopped-packages -n dev.adbw.agent/.ConfigReceiver --es key ...
+ *   adb shell am broadcast --include-stopped-packages -n dev.adbw.agent/.ConfigReceiver \
+ *       --es bridge_id ... --es device_id ... --es key ...
+ * Each computer has its own profile, keyed by its bridge id; setting one up leaves the others
+ * alone. `--ez only true` drops every other computer, `--es remove_bridge ID` drops one.
+ *
  * The manifest requires the sender to hold android.permission.DUMP, which the adb shell has and
  * ordinary apps don't, so another app on the device can't point the agent at a different bridge.
+ *
+ * Replies with data "ok" and, as the result code, how many computers the device now follows.
  */
 class ConfigReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val x = intent.extras ?: return
         val prefs = Prefs(context)
-        x.getString("device_id")?.let { prefs.deviceId = it }
-        x.getString("key")?.let { prefs.key = it }
-        x.getString("bridge_id")?.let { prefs.bridgeId = it }
-        x.getString("host")?.let { prefs.host = if (it == "auto") "" else it }
-        x.getString("host_hint")?.let { prefs.lastHost = it }
-        x.getString("host_name")?.let { prefs.hostName = it }
-        x.getString("adbd_port")?.let { prefs.fixedPort = it.toIntOrNull() }
+        x.getString("remove_bridge")?.let { prefs.removeBridge(it) }
+        val id = x.getString("bridge_id")
+        if (id != null) {
+            val old = prefs.bridge(id)
+            val deviceId = x.getString("device_id") ?: old?.deviceId
+            val key = x.getString("key") ?: old?.key
+            if (deviceId.isNullOrBlank() || key.isNullOrBlank()) {
+                resultData = "error: a new computer needs device_id and key"
+                return
+            }
+            val base = old ?: BridgeProfile(id, deviceId, key)
+            val profile = base.copy(
+                deviceId = deviceId,
+                key = key,
+                name = x.getString("bridge_name") ?: base.name,
+                hostName = x.getString("host_name") ?: base.hostName,
+                host = x.getString("host")?.let { if (it == "auto") "" else it.trim() } ?: base.host,
+                lastHost = x.getString("host_hint") ?: base.lastHost,
+                adbdPort = if (x.containsKey("adbd_port")) x.getString("adbd_port")?.toIntOrNull()
+                else base.adbdPort,
+            )
+            if (x.getBoolean("only")) prefs.bridges = listOf(profile) else prefs.upsertBridge(profile)
+        }
         if (x.containsKey("rearm")) prefs.rearm = x.getBoolean("rearm")
         if (x.containsKey("keep_awake")) prefs.keepAwake = x.getBoolean("keep_awake")
         if (x.containsKey("bind_wifi")) prefs.bindWifi = x.getBoolean("bind_wifi")
         if (x.containsKey("boost_rejoin")) prefs.boostRejoin = x.getBoolean("boost_rejoin")
-        if (AgentState.running) AgentService.applyConfig(context) // reconnect with the new settings
+        if (AgentState.running) AgentService.applyConfig(context) // pick up the changes now
+        resultCode = prefs.bridges.size
         resultData = "ok"
     }
 }

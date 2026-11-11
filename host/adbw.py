@@ -17,6 +17,8 @@ Commands:
     adbw logs NAME           show the agent's own log from a device
     adbw forget NAME         remove a registered device
 
+A device can follow several computers at once: run `adbw setup` for it on each of them.
+
 Python 3.9+, standard library only. Needs `adb` (Android platform-tools).
 """
 from __future__ import annotations
@@ -41,7 +43,7 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 AGENT_PKG = "dev.adbw.agent"
 
@@ -58,6 +60,9 @@ AGENT_PKG = "dev.adbw.agent"
 #   bridge -> CHALLENGE {nonce, mac = HMAC(key, "adbw2-bridge|na|nb")}
 #   agent  -> AUTH      {mac = HMAC(key, "adbw2-agent|na|nb"), name, session, rx, ...}
 #   bridge -> WELCOME   {serial, resume, rx}      (or REJECT {error} at any point)
+#
+# A device that follows several computers keeps a separate id and key for each and runs one link
+# per computer, so nothing here knows or cares about the other computers.
 # ---------------------------------------------------------------------------------------------
 PROTO_VERSION = 2
 T_HELLO, T_WELCOME, T_CHALLENGE, T_AUTH, T_REJECT = 0x01, 0x02, 0x03, 0x04, 0x05
@@ -675,7 +680,8 @@ class Bridge:
         msg = f"ADBW2 {self.listen_port} {self.id} {socket.gethostname()}".encode()
         while True:
             try:
-                sock.sendto(msg, ("255.255.255.255", self.listen_port))
+                # Agents listen on the well-known port; the message says where to connect.
+                sock.sendto(msg, ("255.255.255.255", DEFAULT_LINK_PORT))
             except OSError:
                 pass
             await asyncio.sleep(2)
@@ -783,6 +789,17 @@ def local_ip_towards(target: str) -> Optional[str]:
         return None
 
 
+def version_tuple(v: str) -> tuple:
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)", v or "")
+    return tuple(int(x) for x in m.groups()) if m else ()
+
+
+def agent_version(adb: "Adb") -> tuple:
+    """Version of the agent installed on the device, () if unknown."""
+    m = re.search(r"versionName=(\S+)", adb.shell(f"dumpsys package {AGENT_PKG} | grep versionName"))
+    return version_tuple(m.group(1)) if m else ()
+
+
 def slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "device"
 
@@ -854,8 +871,14 @@ def cmd_setup(args) -> int:
         return adb.shell(f"sha256sum {path[0]}").split(" ")[0] if path else ""
 
     have = installed_sha()
+    theirs = agent_version(adb) if have and have != want else ()
     if have == want:
         print(f"Agent {__version__} is already installed")
+    elif theirs > version_tuple(__version__):
+        # Another computer with a newer adbw set this device up. Its agent still speaks to us
+        # (or says clearly why not), so don't fight over the version.
+        print(f"The device has a newer agent ({'.'.join(map(str, theirs))}); keeping it. "
+              "Update adbw on this computer when you can.")
     elif via_adbw:
         # The agent is carrying this very connection, and replacing it kills it. So push the APK,
         # install it detached on the device, and wait for the new agent to reconnect.
@@ -902,6 +925,9 @@ def cmd_setup(args) -> int:
     # 4. Work out which adbd port the agent should use.
     tls_port = int(adb.prop("service.adb.tls.port") or 0)
     tcp_port = int(adb.prop("service.adb.tcp.port") or 0)
+    # Android 17 hides the TLS port property even from the shell. The setting still says whether
+    # Wireless debugging is on, and the agent finds the port by itself.
+    wireless_on = bool(tls_port) or adb.shell("settings get global adb_wifi_enabled").strip() == "1"
     m = re.match(r"^(\d+\.\d+\.\d+\.\d+):(\d+)$", serial)
     serial_port = int(m.group(2)) if m and not serial.startswith("127.") else 0
     device_ip = m.group(1) if m and not serial.startswith("127.") else None
@@ -911,7 +937,7 @@ def cmd_setup(args) -> int:
         adbd_port = "auto"
     elif serial_port:
         adbd_port = str(serial_port)          # legacy `adb tcpip` port we are connected through
-    elif tls_port:
+    elif wireless_on:
         adbd_port = "auto"
     elif tcp_port:
         adbd_port = str(tcp_port)
@@ -951,9 +977,12 @@ def cmd_setup(args) -> int:
         mm = re.search(r"src (\d+\.\d+\.\d+\.\d+)", adb.shell("ip route get 1.1.1.1"))
         device_ip = mm.group(1) if mm else None
     my_ip = local_ip_towards(device_ip or "192.0.2.1")
+    computer = socket.gethostname().split(".")[0]
     extras = ["--es", "device_id", dev_id, "--es", "key", key,
-              "--es", "bridge_id", bridge_id(state_dir),
-              "--es", "host_name", f"{socket.gethostname().split('.')[0]}.local:{link_port}"]
+              "--es", "bridge_id", bridge_id(state_dir), "--es", "bridge_name", computer,
+              "--es", "host_name", f"{computer}.local:{link_port}"]
+    if args.only:
+        extras += ["--ez", "only", "true"]
     if args.host:
         extras += ["--es", "host", args.host if ":" in args.host else f"{args.host}:{link_port}"]
     elif not via_adbw or args.auto_host:
@@ -968,6 +997,8 @@ def cmd_setup(args) -> int:
     if 'data="ok"' not in out and not via_adbw:  # through adbw the reply can be lost: link restarts
         print("  couldn't configure the agent:", out.splitlines()[-1] if out else rc)
         return 1
+    m = re.search(r"result=(\d+)", out)   # the agent answers with how many computers it follows
+    computers = int(m.group(1)) if m else 0
     if via_adbw:
         time.sleep(2)
     rc, out = adb.run("shell", "am", "start", "-n", f"{AGENT_PKG}/.MainActivity", "--ez", "start", "true")
@@ -977,6 +1008,10 @@ def cmd_setup(args) -> int:
 
     serial_out = f"127.0.0.1:{port}"
     print(f"Registered '{name}' -> adb serial {serial_out}  [{mode}]")
+    if args.only:
+        print("This is now the only computer the device follows.")
+    elif computers > 1:
+        print(f"The device now follows {computers} computers; the others keep working.")
     if not running:
         print("Now start the bridge and keep it running:  adbw run")
         return 0
@@ -1047,12 +1082,34 @@ def cmd_forget(args) -> int:
     if not dev_id:
         print(f"no device named '{args.name}' (see `adbw devices`)")
         return 1
-    d = reg.pop(dev_id)
-    save_registry(args.state_dir, reg)
+    d = reg[dev_id]
+    serial = f"127.0.0.1:{d['port']}"
     exe = find_adb(args.adb)
+    # While the device is still reachable, tell its agent to drop this computer. Other computers
+    # it follows are not affected.
+    told = False
+    st = bridge_running(args.state_dir) or {}
+    live = next((x for x in st.get("devices", []) if x["id"] == dev_id), None)
+    if exe and live and live["link"] == "up":
+        can = version_tuple((live.get("info") or {}).get("agent") or "") >= (0, 3, 0)
+        rc, out = Adb(exe, serial).run(
+            "shell", "am", "broadcast", "--include-stopped-packages",
+            "-n", f"{AGENT_PKG}/.ConfigReceiver",
+            "--es", "remove_bridge", bridge_id(args.state_dir), timeout=10)
+        told = can and 'data="ok"' in out
+        if told:
+            time.sleep(2)  # let the agent close its link before the port goes away
+    del reg[dev_id]
+    save_registry(args.state_dir, reg)
     if exe:
-        Adb(exe).run("disconnect", f"127.0.0.1:{d['port']}")
-    print(f"forgot {d['name']}. The agent app is still on the device; stop or uninstall it there.")
+        Adb(exe).run("disconnect", serial)
+    if told:
+        print(f"forgot {d['name']}. Its agent no longer looks for this computer.")
+    else:
+        print(f"forgot {d['name']}. The device wasn't reachable, so its agent still has this "
+              "computer on its list (it gets refused here). To clear that, run "
+              "`adbw setup --only` for the device from a computer you still use, or uninstall "
+              "the agent app.")
     return 0
 
 
@@ -1122,6 +1179,8 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--name", help="short name for the device (default: its model)")
     p.add_argument("--host", help="pin this computer's IP or DNS name instead of auto-discovery")
     p.add_argument("--auto-host", action="store_true", help="go back to auto-discovery after --host")
+    p.add_argument("--only", action="store_true",
+                   help="make this the only computer the device follows (removes the others)")
     p.add_argument("--adbd-port", type=int, help="force the adbd port the agent relays to")
     p.add_argument("--tcpip", type=int, nargs="?", const=5555,
                    help="open a legacy adb TCP port first (default 5555) if none is open")

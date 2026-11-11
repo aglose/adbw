@@ -25,16 +25,21 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Foreground service that keeps a resumable link from this device to the adbw bridge and relays
- * the bridge's sessions into adbd over loopback.
+ * Foreground service that keeps a resumable link from this device to every adbw bridge it follows
+ * (one per computer set up with `adbw setup`) and relays each bridge's session into adbd over
+ * loopback. The links are independent: each computer gets its own adbd connection.
  *
- * Threads: link loop (connect / read frames), beacon listener (UDP), one pump per session
- * (adbd -> bridge), and a 200 ms ticker (ACKs, PINGs, status, Wireless-debugging re-arm).
+ * Threads: one link loop per computer (connect / read frames), a beacon listener (UDP), one pump
+ * per session (adbd -> bridge), and a 200 ms ticker (ACKs, PINGs, status, Wireless-debugging
+ * re-arm).
  */
 class AgentService : Service() {
     companion object {
@@ -47,7 +52,7 @@ class AgentService : Service() {
             ctx.startForegroundService(Intent(ctx, AgentService::class.java))
         }
 
-        /** Start, or if already running, drop the link so it reconnects with the new settings. */
+        /** Start, or if already running, apply changed settings to the links they affect. */
         fun applyConfig(ctx: Context) {
             if (AgentState.running) {
                 ctx.startService(Intent(ctx, AgentService::class.java).setAction(ACTION_RECONNECT))
@@ -66,32 +71,23 @@ class AgentService : Service() {
     private lateinit var cm: ConnectivityManager
 
     @Volatile private var running = false
-    @Volatile private var link: Link? = null
-    @Volatile private var linkNetwork: Network? = null
-    @Volatile private var linkSince = 0L
-    @Volatile private var session: Session? = null
     @Volatile private var wifiNetwork: Network? = null
-    @Volatile private var beaconHost: InetSocketAddress? = null
     @Volatile private var beaconSocket: DatagramSocket? = null
     @Volatile private var lastAdbdPort: Int? = null
-    @Volatile private var serial: String = ""
+
+    /** One connection per computer, by bridge id. */
+    private val conns = ConcurrentHashMap<String, BridgeConn>()
 
     private var ticker: ScheduledExecutorService? = null
     private var booster: RejoinBooster? = null
-    // Wakes the link loop early (e.g. the moment Wi-Fi comes back) instead of finishing its backoff.
-    private val linkKick = java.util.concurrent.Semaphore(0)
-    @Volatile private var resetBackoff = false
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var multicastLock: WifiManager.MulticastLock? = null
-    private var lastPing = 0L
-    private var lastStatus = 0L
     private var lastRearmCheck = 0L
     private var lastRearm = 0L
     private var lastNotif = ""
     private var lastUi = 0L
-    @Volatile private var lastLinkError = ""
-    private var bindFailures = 0
+    private val bindFailures = AtomicInteger(0)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -104,9 +100,7 @@ class AgentService : Service() {
             return START_NOT_STICKY
         }
         if (intent?.action == ACTION_RECONNECT && running) {
-            AgentState.log("settings changed; reconnecting (session resumes if the bridge is the same)")
-            val l = link
-            Thread { l?.close() }.start()
+            syncConns()
             return START_STICKY
         }
         if (!running) startAgent()
@@ -124,7 +118,8 @@ class AgentService : Service() {
         locator.lastGood = prefs.lastAdbdPort
         cm = getSystemService(ConnectivityManager::class.java)
         startForegroundCompat("starting")
-        AgentState.log("agent started (device ${prefs.deviceId.take(8)})")
+        val names = prefs.bridges.joinToString { it.label }
+        AgentState.log("agent ${versionName()} started; computers: ${names.ifEmpty { "none yet" }}")
 
         val wm = getSystemService(WifiManager::class.java)
         // LOW_LATENCY disables Wi-Fi power save while we're foreground with the screen on.
@@ -148,8 +143,6 @@ class AgentService : Service() {
 
         if (prefs.boostRejoin) booster = RejoinBooster(this).also { it.selfTest() }
         locator.start()
-        Thread(::linkLoop, "adbw-link").apply { isDaemon = true }.start()
-        Thread(::beaconLoop, "adbw-beacon").apply { isDaemon = true }.start()
         ticker = Executors.newSingleThreadScheduledExecutor().also {
             it.scheduleWithFixedDelay({
                 try {
@@ -159,6 +152,45 @@ class AgentService : Service() {
                 }
             }, 200, 200, TimeUnit.MILLISECONDS)
         }
+        syncConns()
+        Thread(::beaconLoop, "adbw-beacon").apply { isDaemon = true }.start()
+    }
+
+    /** Make the running connections match the stored computers: start new ones, stop removed
+     *  ones, and hand changed settings to the rest. Connections that didn't change are untouched,
+     *  so setting up a second computer never disturbs a session on the first. */
+    @Synchronized
+    private fun syncConns() {
+        val wanted = prefs.bridges.associateBy { it.bridgeId }
+        for ((id, c) in conns) {
+            val p = wanted[id]
+            val old = c.profile
+            if (p == null) {
+                conns.remove(id)
+                AgentState.log("${c.tag}removed: this device no longer follows that computer")
+                // The command that removed it often arrived over this very link. Let its reply
+                // get out before the link goes.
+                ticker?.schedule({ c.stop("computer removed") }, 1500, TimeUnit.MILLISECONDS)
+            } else if (p.deviceId != old.deviceId || p.key != old.key) {
+                AgentState.log("${c.tag}new key from `adbw setup`; reconnecting")
+                c.stop("re-keyed")
+                conns[id] = BridgeConn(p).also { it.start() }
+            } else if (p != old) {
+                c.profile = p
+                if (p.host != old.host || p.hostName != old.hostName) {
+                    AgentState.log("${c.tag}address settings changed; reconnecting (the session resumes)")
+                    c.reconnect()
+                } else {
+                    c.kick()
+                }
+            }
+        }
+        for ((id, p) in wanted) {
+            if (!conns.containsKey(id)) {
+                AgentState.log("[${p.label}] following this computer")
+                conns[id] = BridgeConn(p).also { it.start() }
+            }
+        }
     }
 
     override fun onDestroy() {
@@ -167,14 +199,11 @@ class AgentService : Service() {
             AgentState.running = false
             AgentState.status = "stopped"
             AgentState.detail = "stopped"
-            // Network I/O is not allowed on the main thread: tell the bridge from a worker so it
-            // releases the session now instead of holding it for its grace period.
-            val s = session
-            val l = link
-            Thread {
-                s?.abort("agent stopped")
-                l?.close()
-            }.apply { start(); join(1000) }
+            // Network I/O is not allowed on the main thread: tell the bridges from a worker so
+            // they release their sessions now instead of holding them for the grace period.
+            val all = conns.values.toList()
+            conns.clear()
+            Thread { all.forEach { it.stopNow("agent stopped") } }.apply { start(); join(1000) }
             beaconSocket?.close()
             ticker?.shutdownNow()
             try { cm.unregisterNetworkCallback(wifiCallback) } catch (_: Exception) {}
@@ -193,228 +222,337 @@ class AgentService : Service() {
             val previous = wifiNetwork
             wifiNetwork = network
             AgentState.log("Wi-Fi network available")
-            // The link is bound to the old network; drop it now instead of waiting for the
-            // 10 s timeout. The session survives and resumes on the new link.
-            val l = link
-            if (l != null && linkNetwork != null && linkNetwork != network && previous != network) l.close()
             lastRearm = 0
-            // Reconnect to the bridge now, not after the current backoff sleep.
-            resetBackoff = true
-            linkKick.release()
+            for (c in conns.values) {
+                // A link bound to the old network is dead; drop it now instead of waiting for
+                // the 10 s timeout. The session survives and resumes on the new link.
+                val bound = c.linkNetwork
+                if (bound != null && bound != network && previous != network) c.link?.close()
+                // Reconnect now, not after the current backoff sleep.
+                c.kick()
+            }
         }
 
         override fun onLost(network: Network) {
             if (wifiNetwork == network) wifiNetwork = null
             AgentState.log("Wi-Fi network lost")
-            if (linkNetwork == network) link?.close()
+            for (c in conns.values) if (c.linkNetwork == network) c.link?.close()
         }
     }
 
-    // --- Link ------------------------------------------------------------------------------------
-    /**
-     * Where the bridge might be, best first: a pinned host if set; otherwise the bridge's latest
-     * beacon, the last address that worked, then the computer's mDNS name. Unresolved on purpose:
-     * names are looked up at connect time, on the link thread.
-     */
-    private fun hostCandidates(): List<Pair<String, Int>> {
-        fun parse(s: String?): Pair<String, Int>? {
-            if (s.isNullOrBlank()) return null
-            val port = if (s.contains(':')) s.substringAfterLast(':').toIntOrNull() ?: Proto.DEFAULT_PORT
-            else Proto.DEFAULT_PORT
-            return s.substringBeforeLast(':', s) to port
-        }
-        parse(prefs.host)?.let { return listOf(it) }
-        val out = LinkedHashSet<Pair<String, Int>>()
-        beaconHost?.let { out.add(it.hostString to it.port) }
-        parse(prefs.lastHost)?.let(out::add)
-        parse(prefs.hostName)?.let(out::add)
-        return out.toList()
-    }
+    // --- One computer ----------------------------------------------------------------------------
+    /** The link to one computer's bridge, and the adb session it carries. */
+    private inner class BridgeConn(@Volatile var profile: BridgeProfile) {
+        val id = profile.bridgeId
+        val tag: String get() = "[${profile.label}] "
 
-    private fun linkLoop() {
-        var backoff = 250L
-        var failures = 0
-        while (running) {
-            if (prefs.key.isBlank()) {
-                AgentState.status = "not set up: run `adbw setup` on your computer"
-                linkKick.tryAcquire(2000, TimeUnit.MILLISECONDS)
-                continue
+        @Volatile var link: Link? = null
+        @Volatile var linkNetwork: Network? = null
+        @Volatile var ready = false          // handshake done; frames may flow
+        @Volatile var linkSince = 0L
+        @Volatile var session: Session? = null
+        @Volatile var beaconHost: InetSocketAddress? = null
+        @Volatile var lastBeacon = 0L
+        @Volatile var serial = ""
+        @Volatile var state = "starting"
+        @Volatile var adbdPort: Int? = null
+
+        @Volatile private var stopped = false
+        @Volatile private var kicked = false
+        // Wakes the link loop early (Wi-Fi came back, a beacon arrived) instead of finishing its
+        // backoff sleep.
+        private val wake = Semaphore(0)
+        private val loggedErrors = HashSet<String>() // link loop thread only
+        private var lastPing = 0L     // ticker thread only
+        private var lastStatus = 0L   // ticker thread only
+
+        private val active: Boolean get() = running && !stopped
+
+        private fun log(msg: String) = AgentState.log(tag + msg)
+
+        fun start() {
+            Thread(::loop, "adbw-link-$id").apply { isDaemon = true }.start()
+        }
+
+        fun kick() {
+            kicked = true
+            wake.release()
+        }
+
+        /** Drop the link so it reconnects with new settings. Never call socket I/O on the main thread. */
+        fun reconnect() {
+            val l = link
+            Thread { l?.close() }.start()
+            kick()
+        }
+
+        fun stop(reason: String) {
+            Thread { stopNow(reason) }.start()
+        }
+
+        fun stopNow(reason: String) {
+            stopped = true
+            session?.abort(reason)
+            link?.close()
+            wake.release()
+        }
+
+        /**
+         * Where this bridge might be, best first: a pinned host if set; otherwise its latest
+         * beacon, the last address that worked, then the computer's mDNS name. Unresolved on
+         * purpose: names are looked up at connect time, on the link thread.
+         */
+        private fun hostCandidates(): List<Pair<String, Int>> {
+            fun parse(s: String?): Pair<String, Int>? {
+                if (s.isNullOrBlank()) return null
+                val port = if (s.contains(':')) s.substringAfterLast(':').toIntOrNull() ?: Proto.DEFAULT_PORT
+                else Proto.DEFAULT_PORT
+                return s.substringBeforeLast(':', s) to port
             }
-            val hosts = hostCandidates()
-            if (hosts.isEmpty()) {
-                AgentState.status = "waiting for bridge: is `adbw run` running on your computer?"
-                linkKick.tryAcquire(1000, TimeUnit.MILLISECONDS)
-                continue
-            }
-            val (hostStr, hostPort) = hosts[failures % hosts.size]
-            var l: Link? = null
-            var rejected = false
-            try {
-                val target = InetSocketAddress(hostStr, hostPort) // resolves DNS / mDNS names
-                if (target.isUnresolved) throw IOException("can't resolve $hostStr")
-                // Prefer a socket bound to Wi-Fi (on a watch that keeps the link off Bluetooth). If
-                // that fails for any reason (Android 17 refuses the bind with EPERM; the emulator
-                // routes the host differently), retry at once on the default network, and stop
-                // trying to bind after a few failures in a row.
-                AgentState.status = "connecting to $target"
-                var net = if (prefs.bindWifi && bindFailures < 3) wifiNetwork else null
-                var sock: Socket
+            val p = profile
+            parse(p.host)?.let { return listOf(it) }
+            val out = LinkedHashSet<Pair<String, Int>>()
+            beaconHost?.let { out.add(it.hostString to it.port) }
+            parse(p.lastHost)?.let(out::add)
+            parse(p.hostName)?.let(out::add)
+            return out.toList()
+        }
+
+        private fun loop() {
+            var backoff = 250L
+            var failures = 0
+            var rejects = 0
+            var downSince = SystemClock.elapsedRealtime()
+            while (active) {
+                val hosts = hostCandidates()
+                if (hosts.isEmpty()) {
+                    state = "waiting for `adbw run` on that computer"
+                    wake.tryAcquire(1000, TimeUnit.MILLISECONDS)
+                    continue
+                }
+                val (hostStr, hostPort) = hosts[failures % hosts.size]
+                var l: Link? = null
+                var rejected = false
+                var wasUp = false
                 try {
-                    sock = net?.socketFactory?.createSocket() ?: Socket()
-                    sock.tcpNoDelay = true
-                    sock.keepAlive = true
-                    sock.connect(target, 4000)
-                    if (net != null) bindFailures = 0
-                } catch (e: IOException) {
-                    if (net == null) throw e
-                    if (++bindFailures == 3) {
-                        AgentState.log("Wi-Fi-bound sockets keep failing (${e.message}); using the default network")
+                    val target = InetSocketAddress(hostStr, hostPort) // resolves DNS / mDNS names
+                    if (target.isUnresolved) throw IOException("can't resolve $hostStr")
+                    // Prefer a socket bound to Wi-Fi (on a watch that keeps the link off Bluetooth).
+                    // If that fails for any reason (Android 17 refuses the bind with EPERM; the
+                    // emulator routes the host differently), retry at once on the default network,
+                    // and stop trying to bind after a few failures in a row.
+                    state = "connecting to $hostStr"
+                    var net = if (prefs.bindWifi && bindFailures.get() < 3) wifiNetwork else null
+                    var sock: Socket
+                    try {
+                        sock = net?.socketFactory?.createSocket() ?: Socket()
+                        sock.tcpNoDelay = true
+                        sock.keepAlive = true
+                        sock.connect(target, 4000)
+                        if (net != null) bindFailures.set(0)
+                    } catch (e: IOException) {
+                        if (net == null) throw e
+                        if (bindFailures.incrementAndGet() == 3) {
+                            AgentState.log("Wi-Fi-bound sockets keep failing (${e.message}); using the default network")
+                        }
+                        net = null
+                        sock = Socket()
+                        sock.tcpNoDelay = true
+                        sock.keepAlive = true
+                        sock.connect(target, 4000)
                     }
-                    net = null
-                    sock = Socket()
-                    sock.tcpNoDelay = true
-                    sock.keepAlive = true
-                    sock.connect(target, 4000)
-                }
-                sock.soTimeout = Proto.LINK_TIMEOUT_MS
-                l = Link(sock, "$target")
-                link = l
-                linkNetwork = net
+                    sock.soTimeout = Proto.LINK_TIMEOUT_MS
+                    l = Link(sock, "${target.hostString}:${target.port}")
+                    link = l
+                    linkNetwork = net
+                    if (!active) throw IOException("stopped")
 
-                val s = session
-                val key = prefs.key
-                val nonceA = ByteArray(16).also { java.security.SecureRandom().nextBytes(it) }
-                    .joinToString("") { "%02x".format(it) }
-                l.sendJson(Proto.HELLO, JSONObject()
-                    .put("v", Proto.VERSION)
-                    .put("device", prefs.deviceId)
-                    .put("nonce", nonceA))
-                val ch = l.read()
-                if (ch.type == Proto.REJECT) {
-                    rejected = true
-                    throw IOException("bridge refused: " + ch.json().optString("error"))
-                }
-                if (ch.type != Proto.CHALLENGE) throw IOException("expected CHALLENGE, got ${ch.type}")
-                val nonceB = ch.json().getString("nonce")
-                val expected = linkMac(key, "bridge", nonceA, nonceB)
-                if (!java.security.MessageDigest.isEqual(
-                        expected.toByteArray(), ch.json().optString("mac").toByteArray())) {
-                    rejected = true
-                    throw IOException("that bridge doesn't have this device's key (someone else's " +
-                        "computer, or rerun `adbw setup`)")
-                }
-                l.sendJson(Proto.AUTH, JSONObject()
-                    .put("mac", linkMac(key, "agent", nonceA, nonceB))
-                    .put("name", deviceName())
-                    .put("model", Build.MODEL)
-                    .put("sdk", Build.VERSION.SDK_INT)
-                    .put("agent", versionName())
-                    .put("session", s?.sid ?: JSONObject.NULL)
-                    .put("rx", s?.rx ?: 0L))
-                val w = l.read()
-                if (w.type == Proto.REJECT) {
-                    rejected = true
-                    throw IOException("bridge refused: " + w.json().optString("error"))
-                }
-                if (w.type != Proto.WELCOME) throw IOException("expected WELCOME, got ${w.type}")
-                val wj = w.json()
-                serial = wj.optString("serial")
-                if (s != null) {
-                    if (wj.optBoolean("resume")) {
-                        s.attach(l, wj.getLong("rx"))
-                        AgentState.resumes++
-                        AgentState.log("link up to $target; resumed session ${s.sid}")
+                    val s = session
+                    val p = profile
+                    val nonceA = ByteArray(16).also { java.security.SecureRandom().nextBytes(it) }
+                        .joinToString("") { "%02x".format(it) }
+                    l.sendJson(Proto.HELLO, JSONObject()
+                        .put("v", Proto.VERSION)
+                        .put("device", p.deviceId)
+                        .put("nonce", nonceA))
+                    val ch = l.read()
+                    if (ch.type == Proto.REJECT) {
+                        rejected = true
+                        throw IOException("bridge refused: " + ch.json().optString("error"))
+                    }
+                    if (ch.type != Proto.CHALLENGE) throw IOException("expected CHALLENGE, got ${ch.type}")
+                    val nonceB = ch.json().getString("nonce")
+                    val expected = linkMac(p.key, "bridge", nonceA, nonceB)
+                    if (!java.security.MessageDigest.isEqual(
+                            expected.toByteArray(), ch.json().optString("mac").toByteArray())) {
+                        rejected = true
+                        throw IOException("that bridge doesn't have this device's key (another " +
+                            "computer at this address, or rerun `adbw setup`)")
+                    }
+                    l.sendJson(Proto.AUTH, JSONObject()
+                        .put("mac", linkMac(p.key, "agent", nonceA, nonceB))
+                        .put("name", deviceName())
+                        .put("model", Build.MODEL)
+                        .put("sdk", Build.VERSION.SDK_INT)
+                        .put("agent", versionName())
+                        .put("session", s?.sid ?: JSONObject.NULL)
+                        .put("rx", s?.rx ?: 0L))
+                    val w = l.read()
+                    if (w.type == Proto.REJECT) {
+                        rejected = true
+                        throw IOException("bridge refused: " + w.json().optString("error"))
+                    }
+                    if (w.type != Proto.WELCOME) throw IOException("expected WELCOME, got ${w.type}")
+                    val wj = w.json()
+                    serial = wj.optString("serial")
+                    if (s != null) {
+                        if (wj.optBoolean("resume")) {
+                            s.attach(l, wj.getLong("rx"))
+                            AgentState.resumes++
+                            log("link up to ${l.label}; resumed session ${s.sid}")
+                        } else {
+                            s.finish()
+                            log("link up to ${l.label}; bridge dropped old session")
+                        }
                     } else {
-                        s.finish()
-                        AgentState.log("link up to $target; bridge dropped old session")
+                        log("link up to ${l.label} (adb serial there: $serial)" + if (net != null) " via Wi-Fi" else "")
                     }
+                    val at = "${target.hostString}:${target.port}"
+                    prefs.updateBridge(id) { it.copy(lastHost = at, lastSeen = System.currentTimeMillis()) }
+                        ?.let { stored -> profile = stored }
+                    AgentState.linkUps++
+                    linkSince = SystemClock.elapsedRealtime()
+                    lastStatus = 0
+                    backoff = 250
+                    failures = 0
+                    rejects = 0
+                    loggedErrors.clear()
+                    wasUp = true
+                    ready = true
+                    while (active) handle(l, l.read())
+                } catch (e: Exception) {
+                    failures++
+                    // Log a failure once per address and kind until the link is next up, not on
+                    // every retry: a computer that is away would otherwise fill the log.
+                    if (loggedErrors.size > 16) loggedErrors.clear()
+                    if (active && loggedErrors.add("$hostStr:$hostPort ${e.javaClass.simpleName}")) {
+                        log("link to $hostStr:$hostPort: ${e.javaClass.simpleName}: ${e.message}")
+                    }
+                } finally {
+                    ready = false
+                    l?.close()
+                    if (link === l) link = null
+                    session?.detach()
+                }
+                if (!active) break
+                val now = SystemClock.elapsedRealtime()
+                if (wasUp) downSince = now
+                var wait = backoff
+                if (rejected) {
+                    // A refusal won't fix itself in 250 ms. Try the other addresses first (this
+                    // one may belong to a different computer now), then back off for real.
+                    rejects++
+                    val rounds = rejects / hosts.size
+                    wait = if (rejects % hosts.size != 0) 500
+                    else (8000L shl (rounds - 1).coerceIn(0, 3)).coerceAtMost(60_000)
+                }
+                state = if (rejected) "refused by that computer; rerun `adbw setup` there"
+                else "looking for it"
+                val woken = kicked || wake.tryAcquire(wait, TimeUnit.MILLISECONDS)
+                wake.drainPermits()
+                kicked = false
+                if (woken) {
+                    backoff = 250
+                    failures = 0
+                    rejects = 0
+                    downSince = SystemClock.elapsedRealtime()
                 } else {
-                    AgentState.log("link up to $target (adb serial $serial)" + if (net != null) " via Wi-Fi" else "")
+                    // A computer that has been away for minutes (you took the device home, or the
+                    // laptop to work) is checked less often. Its beacon or a Wi-Fi change wakes
+                    // this loop at once.
+                    val cap = if (now - downSince > 120_000) 15_000L else 4000L
+                    backoff = (backoff * 2).coerceAtMost(cap)
                 }
-                prefs.lastHost = "${target.hostString}:${target.port}"
-                AgentState.linkUps++
-                linkSince = SystemClock.elapsedRealtime()
-                lastStatus = 0
-                backoff = 250
-                failures = 0
-                lastLinkError = ""
-                while (running) handle(l, l.read())
-            } catch (e: Exception) {
-                failures++
-                // Log a failure once per host and kind, not on every retry.
-                val kind = "$hostStr:$hostPort ${e.javaClass.simpleName}"
-                if (running && kind != lastLinkError) {
-                    AgentState.log("link to $hostStr:$hostPort: ${e.javaClass.simpleName}: ${e.message}")
-                }
-                lastLinkError = kind
-                // A refusal won't fix itself in 250 ms; don't hammer the bridge.
-                if (rejected) backoff = 8000
-            } finally {
-                l?.close()
-                if (link === l) link = null
-                session?.detach()
             }
-            if (!running) break
-            AgentState.status = "link down, retrying in ${backoff}ms"
-            linkKick.drainPermits()
-            val kicked = linkKick.tryAcquire(backoff, TimeUnit.MILLISECONDS)
-            backoff = if (kicked || resetBackoff) 250 else (backoff * 2).coerceAtMost(4000)
-            if (kicked || resetBackoff) failures = 0
-            resetBackoff = false
+            state = "stopped"
         }
-    }
 
-    private fun handle(l: Link, f: Frame) {
-        when (f.type) {
-            Proto.DATA -> session?.onData(f.u64(), f.payload, 8)
-            Proto.ACK -> session?.onAck(f.u64())
-            Proto.PING -> l.send(Proto.PONG, f.payload)
-            Proto.PONG -> l.rttMs = System.currentTimeMillis() - f.u64()
-            Proto.OPEN -> openSession(l, f.json().getString("session"))
-            Proto.CLOSE -> {
-                val j = f.json()
-                val s = session
-                if (s != null && s.sid == j.getString("session")) {
-                    s.onClose(j.getLong("final"), j.optBoolean("abort"))
+        private fun handle(l: Link, f: Frame) {
+            when (f.type) {
+                Proto.DATA -> session?.onData(f.u64(), f.payload, 8)
+                Proto.ACK -> session?.onAck(f.u64())
+                Proto.PING -> l.send(Proto.PONG, f.payload)
+                Proto.PONG -> l.rttMs = System.currentTimeMillis() - f.u64()
+                Proto.OPEN -> openSession(l, f.json().getString("session"))
+                Proto.CLOSE -> {
+                    val j = f.json()
+                    val s = session
+                    if (s != null && s.sid == j.getString("session")) {
+                        s.onClose(j.getLong("final"), j.optBoolean("abort"))
+                    }
                 }
             }
         }
-    }
 
-    private fun openSession(l: Link, sid: String) {
-        session?.abort("replaced by new session")
-        val candidates = locator.candidates(prefs.fixedPort)
-        var sock: Socket? = null
-        var port = -1
-        for (p in candidates) {
-            try {
-                val s = Socket() // never bound to Wi-Fi: this is loopback
-                s.tcpNoDelay = true
-                s.connect(InetSocketAddress(InetAddress.getLoopbackAddress(), p), 1500)
-                sock = s
-                port = p
-                break
-            } catch (_: IOException) {
+        private fun openSession(l: Link, sid: String) {
+            session?.abort("replaced by new session")
+            val candidates = locator.candidates(profile.adbdPort)
+            var sock: Socket? = null
+            var port = -1
+            for (p in candidates) {
+                try {
+                    val s = Socket() // never bound to Wi-Fi: this is loopback
+                    s.tcpNoDelay = true
+                    s.connect(InetSocketAddress(InetAddress.getLoopbackAddress(), p), 1500)
+                    sock = s
+                    port = p
+                    break
+                } catch (_: IOException) {
+                }
+            }
+            if (sock == null) {
+                val err = "no adbd port reachable on loopback (tried $candidates). Is Wireless debugging on?"
+                log(err)
+                l.sendJson(Proto.OPEN_FAIL, JSONObject().put("session", sid).put("error", err))
+                return
+            }
+            locator.lastGood = port
+            prefs.lastAdbdPort = port
+            lastAdbdPort = port
+            adbdPort = port
+            val s = Session(sid, sock, "127.0.0.1:$port", { log(it) }) { done ->
+                if (session === done) session = null
+            }
+            session = s
+            l.sendJson(Proto.OPEN_OK, JSONObject().put("session", sid).put("target", "127.0.0.1:$port"))
+            s.attach(l, 0)
+            s.start()
+            AgentState.sessions++
+            log("session $sid -> adbd 127.0.0.1:$port")
+        }
+
+        fun tick(now: Long) {
+            val l = link ?: return
+            if (!ready || l.closed) return
+            val s = session
+            if (s != null && s.link === l && s.rx != s.rxAcked) s.sendAck()
+            if (now - lastPing >= Proto.PING_MS) {
+                l.sendU64(Proto.PING, System.currentTimeMillis())
+                lastPing = now
+            }
+            if (now - lastStatus >= 5000) {
+                l.sendJson(Proto.STATUS, statusJson(this))
+                lastStatus = now
             }
         }
-        if (sock == null) {
-            val err = "no adbd port reachable on loopback (tried $candidates). Is Wireless debugging on?"
-            AgentState.log(err)
-            l.sendJson(Proto.OPEN_FAIL, JSONObject().put("session", sid).put("error", err))
-            return
+
+        fun describe(now: Long): String {
+            val l = link
+            if (!ready || l == null) return state
+            val s = session
+            return "UP ${l.label} ${(now - linkSince) / 1000}s rtt ${l.rttMs}ms" +
+                (s?.let { "\n    session ${it.sid}, unacked ${it.unacked}B" } ?: "")
         }
-        locator.lastGood = port
-        prefs.lastAdbdPort = port
-        lastAdbdPort = port
-        val s = Session(sid, sock, "127.0.0.1:$port", AgentState::log) { done ->
-            if (session === done) session = null
-        }
-        session = s
-        l.sendJson(Proto.OPEN_OK, JSONObject().put("session", sid).put("target", "127.0.0.1:$port"))
-        s.attach(l, 0)
-        s.start()
-        AgentState.sessions++
-        AgentState.log("session $sid -> adbd 127.0.0.1:$port")
     }
 
     // --- Bridge discovery ------------------------------------------------------------------------
@@ -431,19 +569,17 @@ class AgentService : Service() {
                     s.receive(p)
                     // "ADBW2 <port> <bridge id> <hostname>"
                     val parts = String(p.data, 0, p.length).split(' ')
-                    if (parts.size >= 3 && parts[0] == "ADBW2") {
-                        val want = prefs.bridgeId
-                        if (want.isNotEmpty() && parts[2] != want) continue // someone else's bridge
-                        val addr = InetSocketAddress(p.address, parts[1].toIntOrNull() ?: continue)
-                        if (addr != beaconHost) {
-                            beaconHost = addr
-                            AgentState.log("bridge beacon: ${p.address.hostAddress}:${parts[1]} (${parts.getOrNull(3)})")
-                            if (link == null) {
-                                resetBackoff = true
-                                linkKick.release()
-                            }
-                        }
-                    }
+                    if (parts.size < 3 || parts[0] != "ADBW2") continue
+                    val c = conns[parts[2]] ?: continue // not one of this device's computers
+                    val addr = InetSocketAddress(p.address, parts[1].toIntOrNull() ?: continue)
+                    val now = SystemClock.elapsedRealtime()
+                    val moved = addr != c.beaconHost
+                    // "Back in view" after a silence also counts: the computer just arrived.
+                    val fresh = moved || now - c.lastBeacon > 10_000
+                    c.beaconHost = addr
+                    c.lastBeacon = now
+                    if (moved) AgentState.log("${c.tag}beacon from ${p.address.hostAddress}:${parts[1]}")
+                    if (fresh && !c.ready) c.kick()
                 }
             }
         } catch (e: Exception) {
@@ -454,19 +590,7 @@ class AgentService : Service() {
     // --- Ticker ----------------------------------------------------------------------------------
     private fun tick() {
         val now = SystemClock.elapsedRealtime()
-        val l = link
-        val s = session
-        if (l != null && !l.closed) {
-            if (s != null && s.link === l && s.rx != s.rxAcked) s.sendAck()
-            if (now - lastPing >= Proto.PING_MS) {
-                l.sendU64(Proto.PING, System.currentTimeMillis())
-                lastPing = now
-            }
-            if (now - lastStatus >= 5000) {
-                l.sendJson(Proto.STATUS, statusJson())
-                lastStatus = now
-            }
-        }
+        for (c in conns.values) c.tick(now)
         booster?.tick(now, wifiNetwork != null)
         if (now - lastRearmCheck >= 3000) {
             lastRearmCheck = now
@@ -478,9 +602,10 @@ class AgentService : Service() {
         }
     }
 
-    /** Android turns Wireless debugging off on every BSSID change; turn it back on. */
+    /** Android turns Wireless debugging off on every BSSID change; turn it back on. Only if some
+     *  computer reaches this device through Wireless debugging rather than a fixed legacy port. */
     private fun maybeRearm(now: Long) {
-        if (!prefs.rearm || prefs.fixedPort != null) return
+        if (!prefs.rearm || conns.values.none { it.profile.adbdPort == null }) return
         if (!WirelessDebugging.canWrite(this) || WirelessDebugging.isEnabled(this)) return
         if (wifiNetwork == null || now - lastRearm < 15_000) return
         lastRearm = now
@@ -496,40 +621,41 @@ class AgentService : Service() {
     }
 
     @Suppress("DEPRECATION")
-    private fun statusJson(): JSONObject {
+    private fun statusJson(c: BridgeConn): JSONObject {
         val info = getSystemService(WifiManager::class.java).connectionInfo
         return JSONObject()
-            .put("adbd", lastAdbdPort?.let { "127.0.0.1:$it" } ?: "?")
+            .put("adbd", (c.adbdPort ?: lastAdbdPort)?.let { "127.0.0.1:$it" } ?: "?")
             .put("wireless_debugging", WirelessDebugging.isEnabled(this))
             .put("secure_settings", WirelessDebugging.canWrite(this))
             .put("wifi_held", wifiNetwork != null)
             .put("rssi_dbm", (info.rssi / 10) * 10) // coarse, so the bridge log isn't noisy
             .put("sdk", Build.VERSION.SDK_INT)
+            .put("computers", conns.size)
     }
 
     private fun updateStatus(now: Long) {
-        val l = link
-        val s = session
-        val linkLine = if (l != null && !l.closed) {
-            "link UP to ${l.label} for ${(now - linkSince) / 1000}s, rtt ${l.rttMs}ms"
-        } else {
-            AgentState.status.takeIf { it.startsWith("link") || it.startsWith("connect") || it.startsWith("waiting") }
-                ?: "link down"
-        }
+        val list = conns.values.sortedBy { it.profile.label }
+        val up = list.count { it.ready }
+        val busy = list.count { it.ready && it.session != null }
         val text = buildString {
-            appendLine(linkLine)
-            appendLine("adb serial on host: ${serial.ifEmpty { "-" }}")
-            appendLine("session: " + (s?.let { "${it.sid} -> ${it.target}, unacked ${it.unacked}B" } ?: "none"))
-            appendLine("adbd port: " + (lastAdbdPort ?: locator.nsdPort ?: prefs.fixedPort ?: "?"))
+            if (list.isEmpty()) appendLine("not set up: run `adbw setup` on your computer")
+            for (c in list) appendLine("${c.profile.label}: ${c.describe(now)}")
+            val fixed = list.mapNotNull { it.profile.adbdPort }.distinct()
+            appendLine("adbd port: " + (lastAdbdPort ?: locator.nsdPort ?: fixed.firstOrNull() ?: "?"))
             appendLine("Wireless debugging: ${if (WirelessDebugging.isEnabled(this@AgentService)) "on" else "off"}" +
                 "   auto re-enable: ${if (WirelessDebugging.canWrite(this@AgentService)) "ready" else "needs grant"}")
             appendLine("Wi-Fi held: ${wifiNetwork != null}")
             append("links ${AgentState.linkUps}  resumes ${AgentState.resumes}  sessions ${AgentState.sessions}")
         }
-        if (l != null && !l.closed) AgentState.status = text.lineSequence().first()
+        AgentState.status = text.lineSequence().first()
         AgentState.detail = text
-        val notif = if (l != null && !l.closed) "Connected to bridge" + (s?.let { " · session active" } ?: "")
-        else "Reconnecting to bridge…"
+        val notif = when {
+            list.isEmpty() -> "Not set up: run adbw setup on your computer"
+            list.size == 1 && up == 1 -> "Connected to ${list[0].profile.label}"
+            list.size == 1 -> "Looking for ${list[0].profile.label}…"
+            up == 0 -> "Looking for your ${list.size} computers…"
+            else -> "Connected to $up of ${list.size} computers"
+        } + if (busy > 0) " · adb active" else ""
         if (notif != lastNotif) {
             lastNotif = notif
             getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification(notif))

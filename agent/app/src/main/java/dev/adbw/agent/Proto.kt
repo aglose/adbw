@@ -20,7 +20,7 @@ import java.nio.ByteBuffer
  *   others    = UTF-8 JSON
  *
  * Handshake (mutual, with the per-device key `adbw setup` stored on both sides):
- *   agent  -> HELLO     {v, device, nonce}
+ *   agent  -> HELLO     {v, device, nonce}      (device = this device's id on that computer)
  *   bridge -> CHALLENGE {nonce, mac = HMAC(key, "adbw2-bridge|na|nb")}
  *   agent  -> AUTH      {mac = HMAC(key, "adbw2-agent|na|nb"), name, session, rx, ...}
  *   bridge -> WELCOME   {serial, resume, rx}      (or REJECT {error} at any point)
