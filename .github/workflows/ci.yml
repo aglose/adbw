@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-tests:
+    name: Host tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.9" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: macos-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.13" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # Fake adbd + simulated agent + a proxy that kills and freezes the link mid-transfer.
+      - name: Resume and auth tests
+        run: python host/test_resume.py
+      - name: CLI smoke test
+        run: python host/adbw.py --version
+
+  build:
+    name: Build agent APK and single-file tool
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build
+        run: python scripts/build_dist.py
+      - name: Run the built file
+        run: |
+          python dist/adbw --version
+          python dist/adbw devices --state-dir "$RUNNER_TEMP/adbw-home"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: adbw-dist
+          path: dist/

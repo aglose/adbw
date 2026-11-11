@@ -1,0 +1,74 @@
+name: Release
+
+# Push a tag like v0.2.0 (matching __version__ in host/adbw.py) to publish a release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Check the tag matches the version
+        run: |
+          version=$(python -c "import re;print(re.search(r'__version__ = \"([^\"]+)\"', open('host/adbw.py').read()).group(1))")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match __version__ $version"; exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Tests
+        run: python host/test_resume.py
+
+      # The agent must be signed with the same key in every release, or updates won't install
+      # over an older copy. The keystore lives in repository secrets.
+      - name: Prepare signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.ADBW_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/adbw-release.jks"
+            echo "ADBW_KEYSTORE=$RUNNER_TEMP/adbw-release.jks" >> "$GITHUB_ENV"
+          else
+            echo "::warning::ADBW_KEYSTORE_B64 is not set; the APK gets a throwaway debug signature"
+          fi
+
+      - name: Build
+        env:
+          ADBW_KEYSTORE_PASSWORD: ${{ secrets.ADBW_KEYSTORE_PASSWORD }}
+        run: |
+          python scripts/build_dist.py
+          python dist/adbw --version
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist && shasum -a 256 adbw adbw-agent.apk > SHA256SUMS && cd ..
+          gh release create "$GITHUB_REF_NAME" dist/adbw dist/adbw-agent.apk dist/SHA256SUMS \
+            --title "adbw $VERSION" --generate-notes
+
+      - name: Point the Homebrew formula at this release
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+          python scripts/update_formula.py "$VERSION" dist/adbw
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/adbw.rb
+          git commit -m "Formula: adbw $VERSION" || exit 0
+          git push origin main
