@@ -91,6 +91,7 @@ class AgentService : Service() {
     private var lastNotif = ""
     private var lastUi = 0L
     @Volatile private var lastLinkError = ""
+    private var bindFailures = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -251,14 +252,30 @@ class AgentService : Service() {
             try {
                 val target = InetSocketAddress(hostStr, hostPort) // resolves DNS / mDNS names
                 if (target.isUnresolved) throw IOException("can't resolve $hostStr")
-                // Alternate Wi-Fi-bound and default-network sockets when connects keep failing
-                // (some networks, like the emulator's, route the host differently).
-                val net = if (prefs.bindWifi && failures % 2 == 0) wifiNetwork else null
-                val sock = net?.socketFactory?.createSocket() ?: Socket()
-                sock.tcpNoDelay = true
-                sock.keepAlive = true
+                // Prefer a socket bound to Wi-Fi (on a watch that keeps the link off Bluetooth). If
+                // that fails for any reason (Android 17 refuses the bind with EPERM; the emulator
+                // routes the host differently), retry at once on the default network, and stop
+                // trying to bind after a few failures in a row.
                 AgentState.status = "connecting to $target"
-                sock.connect(target, 4000)
+                var net = if (prefs.bindWifi && bindFailures < 3) wifiNetwork else null
+                var sock: Socket
+                try {
+                    sock = net?.socketFactory?.createSocket() ?: Socket()
+                    sock.tcpNoDelay = true
+                    sock.keepAlive = true
+                    sock.connect(target, 4000)
+                    if (net != null) bindFailures = 0
+                } catch (e: IOException) {
+                    if (net == null) throw e
+                    if (++bindFailures == 3) {
+                        AgentState.log("Wi-Fi-bound sockets keep failing (${e.message}); using the default network")
+                    }
+                    net = null
+                    sock = Socket()
+                    sock.tcpNoDelay = true
+                    sock.keepAlive = true
+                    sock.connect(target, 4000)
+                }
                 sock.soTimeout = Proto.LINK_TIMEOUT_MS
                 l = Link(sock, "$target")
                 link = l

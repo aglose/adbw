@@ -41,7 +41,7 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 AGENT_PKG = "dev.adbw.agent"
 
