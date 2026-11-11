@@ -47,6 +47,12 @@ On Windows, run it as `py adbw ...`.
 brew tap aglose/adbw https://github.com/aglose/adbw
 ```
 
+Recent Homebrew versions ask you to trust a third-party tap before using it:
+
+```bash
+brew trust aglose/adbw
+```
+
 ```bash
 brew install adbw
 ```
