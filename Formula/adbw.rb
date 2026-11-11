@@ -2,9 +2,9 @@
 class Adbw < Formula
   desc "Wireless adb that survives Wi-Fi drops"
   homepage "https://github.com/aglose/adbw"
-  url "https://github.com/aglose/adbw/releases/download/v0.2.1/adbw"
-  version "0.2.1"
-  sha256 "dad67303620e5101171b74eb40498dc95cbc3edb76b089a09ddcda5d8fd18f49"
+  url "https://github.com/aglose/adbw/releases/download/v0.3.0/adbw"
+  version "0.3.0"
+  sha256 "c272e114c849fae2305a417fa2a7c0fb5f9d7e346317ab9cc4e5a27f150a15b2"
   license "MIT"
 
   uses_from_macos "python"
