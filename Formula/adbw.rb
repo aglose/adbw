@@ -4,7 +4,7 @@ class Adbw < Formula
   homepage "https://github.com/aglose/adbw"
   url "https://github.com/aglose/adbw/releases/download/v0.2.0/adbw"
   version "0.2.0"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "764e29c16e81dca5366baae57b924ca37157e00544d6a0fb0fc6401e8eb6c0cc"
   license "MIT"
 
   uses_from_macos "python"
