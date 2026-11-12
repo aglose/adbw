@@ -768,7 +768,7 @@ def find_apk(state_dir: Path) -> Optional[Path]:
                 return None
             data = z.read("agent.apk")
         out = state_dir / "cache" / f"adbw-agent-{__version__}.apk"
-        if not out.exists() or out.stat().st_size != len(data):
+        if not out.exists() or out.read_bytes() != data:  # same size is not same file
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_bytes(data)
         return out
