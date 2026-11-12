@@ -158,7 +158,8 @@ How it behaves:
 
 ## Updating
 
-**1. Update the tool:** `brew upgrade adbw`, or download the new file from the
+**1. Update the tool:** `brew update` and then `brew upgrade adbw` (without the first, Homebrew
+may not have seen the new version yet), or download the new file from the
 [latest release](https://github.com/aglose/adbw/releases/latest) over the old one.
 
 **2. Restart the bridge:** press Ctrl-C in the terminal running `adbw run` and start it again.
@@ -308,6 +309,7 @@ agent APK in every release is signed with the same key, so updates install over 
 
 Early but working. Tested on a Pixel 10 Pro XL (Android 17, Wireless debugging), an Android 13
 userdebug device with a legacy adb port, and an Android 14 emulator, from macOS. Following two
-computers was tested on the Pixel with two bridges on one Mac, not yet with two machines. The Homebrew install is checked on macOS in CI. The host tests
+computers was tested on the Pixel with two bridges on one Mac, not yet with two machines. The Homebrew install and upgrade were done by hand on macOS, and CI repeats the install from
+the tap on every push. The host tests
 also run on Linux and Windows in CI; the device flow hasn't been tried from Windows. Wear OS is
 untested.
