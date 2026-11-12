@@ -59,8 +59,10 @@ brew trust aglose/adbw
 brew install adbw
 ```
 
-If you earlier copied the single file into Homebrew's `bin` folder yourself, delete that copy
-first, or `brew install` will refuse to overwrite it.
+It installs as a cask (one prebuilt file), so it doesn't need Xcode or its Command Line Tools.
+It does need `python3` and `adb` on your PATH; `brew install python android-platform-tools`
+provides both. If you earlier copied the single file into Homebrew's `bin` folder yourself,
+delete that copy first, or the install will refuse to overwrite it.
 
 ## Use
 
@@ -279,7 +281,7 @@ The first runs the host tests (no device needed). The second builds `dist/adbw` 
 `ADBW_KEYSTORE_PASSWORD` to sign the agent with a stable key.
 
 To release: bump `__version__` in `host/adbw.py`, tag `vX.Y.Z`, push the tag. The Release
-workflow builds, publishes the files and updates the Homebrew formula.
+workflow builds, publishes the files and updates the Homebrew cask.
 
 | Path | What |
 |---|---|
@@ -294,6 +296,7 @@ workflow builds, publishes the files and updates the Homebrew formula.
 
 | Version | What changed |
 |---|---|
+| 0.3.1 | Homebrew install fixed: it is now a cask and no longer needs Xcode Command Line Tools. Ctrl-C stops the bridge without a traceback. |
 | 0.3.0 | A device can follow several computers at once. `adbw setup --only`; `adbw forget` also tells the device; an older adbw no longer tries to downgrade a newer agent; setup recognises Wireless debugging on Android 17. |
 | 0.2.1 | Fixed connecting on Android 17, which refuses sockets bound to the Wi-Fi network. |
 | 0.2.0 | First release: single-file tool with the agent inside, per-device keys, automatic discovery, `adbw setup`. |
@@ -305,8 +308,6 @@ agent APK in every release is signed with the same key, so updates install over 
 
 Early but working. Tested on a Pixel 10 Pro XL (Android 17, Wireless debugging), an Android 13
 userdebug device with a legacy adb port, and an Android 14 emulator, from macOS. Following two
-computers was tested on the Pixel with two bridges on one Mac, not yet with two machines.
-Installing through Homebrew hasn't been tried end to end yet; the single file is what the tests
-above used. The host tests
+computers was tested on the Pixel with two bridges on one Mac, not yet with two machines. The Homebrew install is checked on macOS in CI. The host tests
 also run on Linux and Windows in CI; the device flow hasn't been tried from Windows. Wear OS is
 untested.

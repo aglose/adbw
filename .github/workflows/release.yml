@@ -62,13 +62,13 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/adbw dist/adbw-agent.apk dist/SHA256SUMS \
             --title "adbw $VERSION" --generate-notes
 
-      - name: Point the Homebrew formula at this release
+      - name: Point the Homebrew cask at this release
         run: |
           git fetch origin main
           git checkout -B main origin/main
-          python scripts/update_formula.py "$VERSION" dist/adbw
+          python scripts/update_cask.py "$VERSION" dist/adbw
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/adbw.rb
-          git commit -m "Formula: adbw $VERSION" || exit 0
+          git add Casks/adbw.rb
+          git commit -m "Cask: adbw $VERSION" || exit 0
           git push origin main

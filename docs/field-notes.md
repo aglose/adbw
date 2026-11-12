@@ -122,6 +122,14 @@ Limits:
 - The booster's benefit for a plain out-of-range drop hasn't been measured yet. Shell-based
   simulations of "the access point vanished" weren't reliable.
 
+## Packaging
+
+**A Homebrew formula without a bottle needs a compiler toolchain, even to copy one file.** The
+first end-to-end `brew install` failed on a Mac whose Command Line Tools were older than its
+macOS: Homebrew treats any formula without a prebuilt bottle as a source build and refuses to
+start. adbw is a single prebuilt file, so it ships as a cask instead, which has no such check.
+CI now installs it from the tap on macOS.
+
 ## Open items
 
 - Following several computers has only been tried with two bridges on one machine.

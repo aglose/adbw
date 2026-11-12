@@ -55,3 +55,21 @@ jobs:
         with:
           name: adbw-dist
           path: dist/
+
+  homebrew:
+    name: Homebrew install from this tap
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Installs the released file the cask points at, the way the README says to.
+      - name: Tap, trust, install
+        run: |
+          brew tap aglose/adbw "$GITHUB_WORKSPACE"
+          brew trust aglose/adbw || true   # older Homebrew has no trust step
+          brew install adbw
+      - name: Run the installed tool
+        run: |
+          want=$(sed -n 's/^  version "\(.*\)"/\1/p' Casks/adbw.rb)
+          test "$(adbw --version)" = "adbw $want"
+          adbw devices --state-dir "$RUNNER_TEMP/adbw-home"
+          brew uninstall adbw

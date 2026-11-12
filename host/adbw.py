@@ -43,7 +43,7 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 AGENT_PKG = "dev.adbw.agent"
 
@@ -714,8 +714,29 @@ class Bridge:
                  __version__, self.id, addrs, self.adb or "not found; no auto-connect")
         if not self.devices:
             log.info("no devices registered yet: connect one with adb and run `adbw setup`")
-        async with server:
-            await server.serve_forever()
+        try:
+            async with server:
+                await server.serve_forever()
+        finally:
+            await self.shutdown()
+
+    async def shutdown(self) -> None:
+        """Stop cleanly (Ctrl-C): end sessions, close links and listeners, and let every task
+        finish, so nothing is left for the interpreter to complain about on the way out."""
+        tasks = list(getattr(self, "_tasks", []))
+        for d in self.devices.values():
+            if d.grace_task:
+                tasks.append(d.grace_task)
+            if d.session:
+                d.session.abort("bridge stopped")
+            if d.link:
+                d.link.close()
+            if d.server:
+                d.server.close()
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(0.05)  # one turn of the loop so closed transports are released
 
 
 # ---------------------------------------------------------------------------------------------
